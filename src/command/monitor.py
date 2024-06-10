@@ -1,21 +1,23 @@
 from __future__ import annotations
-from typing import Union, Final, Optional
-from collections.abc import MutableMapping, Iterable, Mapping
+from typing import Union, Final, Optional, ClassVar
+from collections.abc import MutableMapping, Iterable
 
+import enum
 import gc
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from collections import defaultdict, Counter
-from contextlib import AbstractContextManager
-from itertools import islice
+from itertools import islice, chain, repeat
 from traceback import format_exc
 from telethon.errors import BadRequestError
 
 from . import inner
 from .utils import escape_html, unsub_all_and_leave_chat
 from .. import log, db, env, web, locks
+from ..helpers.queue import queued
+from ..helpers.timeout import BatchTimeout
 from ..errors_collection import EntityNotFoundError, UserBlockedErrors
 from ..i18n import i18n
 from ..parsing.post import get_post_from_entry, Post
@@ -30,27 +32,20 @@ __user_unsub_all_lock_bucket: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock
 __user_blocked_counter = Counter()
 
 
-# TODO: move inside MonitoringStat once the minimum Python requirement is 3.10
+# TODO: move inside MonitoringCounter once the minimum Python requirement is 3.10
 # @staticmethod
 def _gen_property(key: str):
     def getter(self):
-        return self.counter[key]
+        return self[key]
 
     def setter(self, value):
-        self.counter[key] = value
+        self[key] = value
 
     return property(getter, setter)
 
 
-class MonitoringStat(AbstractContextManager):
-    # TODO: make __monitor directly call this class's method to log and make statistics
-    class Meta:
-        counter: MutableMapping[str, int] = Counter()
-        last_summary_time: float = env.loop.time()
-        task_finished: set[object] = set()
-        task_in_progress: set[object] = set()
-        task_stuck: set[object] = set()
-        summary_period: float = TIMEOUT  # seconds
+class MonitoringCounter(Counter[str, int]):
+    FINISHED: int = _gen_property('FINISHED')
 
     not_updated: int = _gen_property('not_updated')
     cached: int = _gen_property('cached')
@@ -62,110 +57,326 @@ class MonitoringStat(AbstractContextManager):
     cancelled: int = _gen_property('cancelled')
     unknown_error: int = _gen_property('unknown_error')
     timeout_unknown_error: int = _gen_property('timeout_unknown_error')
+    deferred: int = _gen_property('deferred')
+    resubmitted: int = _gen_property('resubmitted')
 
-    @staticmethod
-    def _stat(counter: Mapping) -> str:
-        return ', '.join(filter(None, (
-            f'updated({counter["updated"]})',
-            f'not updated({counter["not_updated"]}, including {counter["cached"]} cached and {counter["empty"]} empty)',
-            f'fetch failed({counter["failed"]})' if counter["failed"] else '',
-            f'skipped({counter["skipped"]})' if counter["skipped"] else '',
-            f'timeout({counter["timeout"]})' if counter["timeout"] else '',
-            f'cancelled({counter["cancelled"]})' if counter["cancelled"] else '',
-            f'unknown error({counter["unknown_error"]})' if counter["unknown_error"] else '',
-            f'timeout w/ unknown error({counter["timeout_unknown_error"]})' if counter["timeout_unknown_error"] else '',
-        )))
 
+class MonitoringStat:
     def __init__(self):
-        self.print_summary()
-        self.counter: MutableMapping[str, int] = Counter()
-        self._token = object()
-        self.Meta.task_in_progress.add(self._token)
+        self._counter_tier1: MonitoringCounter = MonitoringCounter()  # periodical summary
+        self._counter_tier2: MonitoringCounter = MonitoringCounter()  # unconditional summary
+        self._tier1_last_summary_time: Optional[float] = None
+        self._tier2_last_summary_time: Optional[float] = self._tier1_last_summary_time
+        self._tier1_summary_period: float = TIMEOUT  # seconds
+        # No need to set _tier2_summary_period since _counter_tier2 is unconditionally summarized in print_summary.
+        self._in_progress_count: int = 0
 
-    def __exit__(self, *args):
-        meta = self.Meta
-        try:
-            meta.counter += self.counter
-            level = logging.DEBUG
-            if self.timeout or self.cancelled or self.unknown_error or self.timeout_unknown_error:
-                level = logging.WARNING
-            msg = f'Finished a monitoring task: {self._stat(self.counter)}'
-            logger.log(level, msg)
-        finally:
-            meta.task_in_progress.discard(self._token)
-            meta.task_stuck.discard(self._token)
-            meta.task_finished.add(self._token)
-            self.print_summary()
+    def not_updated(self):
+        self._counter_tier2['not_updated'] += 1
 
-    @classmethod
-    def print_summary(cls):
-        meta = cls.Meta
-        now = env.loop.time()
-        time_diff = round(now - meta.last_summary_time)
-        if time_diff < meta.summary_period:
-            return
-        logger.info(
-            f'{len(meta.task_finished)} monitoring tasks finished in the past {time_diff}s'
-            + (f', while {len(meta.task_in_progress)} are still in progress' if meta.task_in_progress else '') +
-            f'. Subtask summary of finished tasks: {cls._stat(meta.counter)}'
+    def cached(self):
+        self._counter_tier2['cached'] += 1
+        self.not_updated()
+
+    def empty(self):
+        self._counter_tier2['empty'] += 1
+        self.not_updated()
+
+    def failed(self):
+        self._counter_tier2['failed'] += 1
+
+    def updated(self):
+        self._counter_tier2['updated'] += 1
+
+    def skipped(self):
+        self._counter_tier2['skipped'] += 1
+
+    def timeout(self):
+        self._counter_tier2['timeout'] += 1
+
+    def cancelled(self):
+        self._counter_tier2['cancelled'] += 1
+
+    def unknown_error(self):
+        self._counter_tier2['unknown_error'] += 1
+
+    def timeout_unknown_error(self):
+        self._counter_tier2['timeout_unknown_error'] += 1
+
+    def deferred(self):
+        self._counter_tier2['deferred'] += 1
+
+    def resubmitted(self):
+        self._counter_tier2['resubmitted'] += 1
+
+    def start(self):
+        self._in_progress_count += 1
+
+    def finish(self):
+        self._in_progress_count -= 1
+        self._counter_tier2['FINISHED'] += 1
+
+    def _stat(self, counter: MonitoringCounter) -> str:
+        scheduling_stat = ', '.join(filter(None, (
+            f'in progress({self._in_progress_count})' if self._in_progress_count else '',
+            f'deferred({counter.deferred})' if counter.deferred else '',
+            f'resubmitted({counter.resubmitted})' if counter.resubmitted else '',
+        )))
+        if not counter.FINISHED:
+            return scheduling_stat
+        finished_stat = f'finished({counter.FINISHED}). Details of finished subtasks: ' + ', '.join(filter(None, (
+            f'updated({counter.updated})' if counter.updated else '',
+            f'not updated({counter.not_updated}, including {counter.cached} cached and {counter.empty} empty)'
+            if counter.not_updated
+            else '',
+            f'fetch failed({counter.failed})' if counter.failed else '',
+            f'skipped({counter.skipped})' if counter.skipped else '',
+            f'cancelled({counter.cancelled})' if counter.cancelled else '',
+            f'unknown error({counter.unknown_error})' if counter.unknown_error else '',
+            f'timeout({counter.timeout})' if counter.timeout else '',
+            f'timeout w/ unknown error({counter.timeout_unknown_error})' if counter.timeout_unknown_error else '',
+        )))
+        return ', '.join(filter(None, (scheduling_stat, finished_stat)))
+
+    def _summarize(self, counter: MonitoringCounter, default_log_level: int, time_diff: int):
+        stat = self._stat(counter) or 'nothing was submitted'
+        logger.log(
+            logging.WARNING
+            if counter.cancelled or counter.unknown_error or counter.timeout or counter.timeout_unknown_error
+            else default_log_level,
+            f'Summary of monitoring subtasks in the past {time_diff}s: {stat}.'
         )
-        if meta.task_stuck:
-            logger.warning(
-                f'{len(meta.task_stuck)} monitoring tasks are still in progress after >{time_diff}s, '
-                'are they stuck?'
-            )
-        meta.last_summary_time = now
-        meta.task_stuck |= meta.task_in_progress
-        meta.task_in_progress.clear()
-        meta.task_finished.clear()
-        meta.counter.clear()
+
+    def print_summary(self):
+        now = env.loop.time()
+
+        if self._tier1_last_summary_time is None:
+            self._tier1_last_summary_time = now
+            self._tier2_last_summary_time = now
+            return
+
+        if self._in_progress_count < 0:
+            logger.error(f'Unexpected negative in-progress count ({self._in_progress_count})')
+
+        tier2_time_diff = round(now - self._tier2_last_summary_time)
+        self._summarize(self._counter_tier2, logging.DEBUG, tier2_time_diff)
+        self._tier2_last_summary_time = now
+        self._counter_tier1 += self._counter_tier2
+        self._counter_tier2.clear()
         gc.collect()
 
+        tier1_time_diff = round(now - self._tier1_last_summary_time)
+        if tier1_time_diff < self._tier1_summary_period:
+            return
+        self._summarize(self._counter_tier1, logging.INFO, tier1_time_diff)
+        self._tier1_last_summary_time = now
+        self._counter_tier1.clear()
 
-async def run_monitor_task():
-    feed_id_to_monitor = db.effective_utils.EffectiveTasks.get_tasks()
-    if not feed_id_to_monitor:
-        return
 
-    feeds = await db.Feed.filter(id__in=feed_id_to_monitor)
+class TaskState(enum.IntFlag):
+    EMPTY = 0
+    LOCKED = 1 << 0
+    IN_PROGRESS = 1 << 1
+    DEFERRED = 1 << 2
 
-    logger.debug('Started a monitoring task.')
-    wait_for = TIMEOUT
 
-    with MonitoringStat() as stat:
-        task_feed_map = {
-            env.loop.create_task(__monitor(feed, stat)): feed
-            for feed in feeds
-        }
-        done, pending = await asyncio.wait(task_feed_map.keys(), timeout=wait_for)
+FEED_OR_ID = Union[int, db.Feed]
 
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError as e:
-                stat.timeout += 1
-                feed = task_feed_map[task]
-                logger.error(f'Monitoring subtask timed out after {wait_for}s: {feed.link}', exc_info=e)
-            except Exception as e:
-                stat.timeout_unknown_error += 1
-                feed = task_feed_map[task]
-                logger.error(
-                    f'Monitoring subtask timed out after {wait_for}s and caused an unknown error: {feed.link}',
-                    exc_info=e
-                )
 
-        for task in done:
-            try:
-                await task
-            except asyncio.CancelledError as e:
-                stat.cancelled += 1
-                feed = task_feed_map[task]
-                logger.error(f'Monitoring subtask failed due to CancelledError: {feed.link}', exc_info=e)
-            except Exception as e:
-                stat.unknown_error += 1
-                feed = task_feed_map[task]
-                logger.error(f'Monitoring failed due to an unknown error: {feed.link}', exc_info=e)
+class Monitor:
+    _singleton: ClassVar[Monitor] = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._singleton is None:
+            return object.__new__(cls)
+        raise RuntimeError('A singleton instance already exists, use get_instance() instead.')
+
+    @classmethod
+    def get_instance(cls):
+        if cls._singleton is None:
+            cls._singleton = cls()  # implicitly calls __new__ then __init__
+        return cls._singleton
+
+    def __init__(self):
+        self._stat = MonitoringStat()
+        self._bg_task: Optional[asyncio.Task] = None
+        # Synchronous operations are atomic from the perspective of asynchronous coroutines, so we can just use a map
+        # plus additional prologue & epilogue to simulate an asynchronous lock.
+        # In the meantime, the deferring logic is implemented using this map.
+        self._subtask_defer_map: defaultdict[int, TaskState] = defaultdict(lambda: TaskState.EMPTY)
+        self._lock_up_period: int = 0  # in seconds
+
+        # update _lock_up_period on demand
+        db.effective_utils.EffectiveOptions.add_set_callback('minimal_interval', self._update_lock_up_period_cb)
+
+    def _update_lock_up_period_cb(self, key: str, value: int, expected_key: str = 'minimal_interval'):
+        if key != expected_key:
+            raise KeyError(f'Invalid key: {key}, expected: {expected_key}')
+        if not isinstance(value, int):
+            raise TypeError(f'Invalid type of value: {type(value)}, expected: int')
+        if value <= 1:
+            # The minimal scheduling interval is 1 minute, it is meaningless to lock.
+            self._lock_up_period = 0  # which means locks are disabled
+            return
+        # Convert minutes to seconds, then subtract 10 seconds to prevent locks from being released too late
+        # (i.e., released only after causing a new subtask being deferred).
+        self._lock_up_period = value * 60 - 10
+
+    async def _ensure_db_feeds(self, feeds: Iterable[FEED_OR_ID]) -> Optional[Iterable[db.Feed]]:
+        if not feeds:
+            return None
+
+        db_feeds: set[db.Feed] = set()
+        feed_ids: set[int] = set()
+        for feed in feeds:
+            if isinstance(feed, db.Feed):
+                if not self._defer_feed_id(feed.id, feed.link):
+                    db_feeds.add(feed)
+            else:
+                feed_id = feed
+                if not self._defer_feed_id(feed_id):
+                    feed_ids.add(feed_id)
+        if feed_ids:
+            db_feeds_to_merge = await db.Feed.filter(id__in=feed_ids)
+            db_feeds.update(db_feeds_to_merge)
+            if len(db_feeds_to_merge) != len(feed_ids):
+                feed_ids_not_found = feed_ids - {feed.id for feed in db_feeds_to_merge}
+                logger.error(f'Feeds {feed_ids_not_found} not found, but they were submitted to the monitor queue.')
+
+        return db_feeds
+
+    def _on_subtask_canceled(self, err: BaseException, feed: db.Feed):
+        self._stat.cancelled()
+        logger.error(f'Monitoring subtask failed due to CancelledError: {feed.id}: {feed.link}', exc_info=err)
+
+    def _on_subtask_unknown_error(self, err: BaseException, feed: db.Feed):
+        self._stat.unknown_error()
+        logger.error(f'Monitoring subtask failed due to an unknown error: {feed.id}: {feed.link}', exc_info=err)
+
+    def _on_subtask_timeout(self, err: BaseException, feed: db.Feed):
+        self._stat.timeout()
+        logger.error(f'Monitoring subtask timed out after {TIMEOUT}s: {feed.id}: {feed.link}', exc_info=err)
+
+    def _on_subtask_timeout_unknown_error(self, err: BaseException, feed: db.Feed):
+        self._stat.timeout_unknown_error()
+        logger.error(
+            f'Monitoring subtask timed out after {TIMEOUT}s and caused an unknown error: {feed.id}: {feed.link}',
+            exc_info=err
+        )
+
+    # In the foreseeable future, we may use a PriorityQueue here to prioritize some jobs.
+    @queued
+    async def _do_monitor_task(self, feeds: Iterable[FEED_OR_ID]):
+        # Previously, this was a tail call (self._ensure_db_feeds() calls self._do_monitor_task() at the end).
+        # It turned out that the tail call made the frame of self._ensure_db_feeds(), which keep referencing all db.Feed
+        # objects produced there, persisted until self._do_monitor_task() was done.
+        # The garbage collector was unable to collect any db.Feed objects in such a circumstance.
+        # So it is now a head call to solve this issue.
+        feeds: Iterable[db.Feed] = await self._ensure_db_feeds(feeds)
+        if not feeds:
+            return
+
+        _do_monitor_subtask: BatchTimeout[db.Feed, None]
+        async with BatchTimeout(
+                self._do_monitor_subtask,
+                timeout=TIMEOUT,
+                loop=env.loop,
+                on_canceled=self._on_subtask_canceled,
+                on_error=self._on_subtask_unknown_error,
+                on_timeout=self._on_subtask_timeout,
+                on_timeout_error=self._on_subtask_timeout_unknown_error,
+        ) as _do_monitor_subtask:
+            for feed in feeds:
+                self._lock_feed_id(feed.id)
+                _do_monitor_subtask(feed, _task_name_suffix=feed.id)
+            # Release unnecessary references to db.Feed objects so that they can be garbage collected later.
+            del feeds
+
+    _do_monitor_task_queued_nowait = _do_monitor_task.queued_nowait
+
+    async def _do_monitor_subtask(self, feed: db.Feed):
+        self._subtask_defer_map[feed.id] |= TaskState.IN_PROGRESS
+        self._stat.start()
+        try:
+            await _do_monitor_a_feed(feed, self._stat)
+        finally:
+            self._erase_state_for_feed_id(feed.id, TaskState.IN_PROGRESS)
+            self._stat.finish()
+
+    def _lock_feed_id(self, feed_id: int):
+        if not self._lock_up_period:  # lock disabled
+            return
+        # Caller MUST ensure that self._subtask_defer_map[feed_id] can be overwritten safely.
+        self._subtask_defer_map[feed_id] = TaskState.LOCKED
+        # unlock after the lock-up period
+        env.loop.call_later(
+            self._lock_up_period,
+            self._erase_state_for_feed_id,
+            feed_id, TaskState.LOCKED
+        )
+
+    def _erase_state_for_feed_id(self, feed_id: int, flag_to_erase: TaskState):
+        task_state = self._subtask_defer_map[feed_id]
+        if not task_state:
+            logger.warning(f'Unexpected empty state ({repr(task_state)}): {feed_id}')
+            return
+        erased_state = task_state & ~flag_to_erase
+        if erased_state == TaskState.DEFERRED:  # deferred with any other flag erased, resubmit it
+            self._subtask_defer_map[feed_id] = TaskState.EMPTY
+            self.submit_feed(feed_id)
+            self._stat.resubmitted()
+            logger.debug(f'Resubmitted a deferred subtask ({repr(task_state)}): {feed_id}')
+            return
+        self._subtask_defer_map[feed_id] = erased_state  # update the state
+
+    def _defer_feed_id(self, feed_id: int, feed_link: str = None) -> bool:
+        feed_description = f'{feed_id}: {feed_link}' if feed_link else str(feed_id)
+        task_state = self._subtask_defer_map[feed_id]
+        if task_state == TaskState.DEFERRED:
+            # This should not happen, but just in case.
+            logger.warning(f'A deferred subtask ({repr(task_state)}) was never resubmitted: {feed_description}')
+            # fall through
+        elif task_state:  # defer if any other flag is set
+            # Set the DEFERRED flag, this can be done for multiple times safely.
+            self._subtask_defer_map[feed_id] = task_state | TaskState.DEFERRED
+            self._stat.deferred()
+            logger.debug(f'Deferred ({repr(task_state)}): {feed_description}')
+            return True  # deferred, later operations should be skipped
+        return False  # not deferred
+
+    def submit_feeds(self, feeds: Iterable[FEED_OR_ID]):
+        self._do_monitor_task_queued_nowait(feeds)
+
+    def submit_feed(self, feed: FEED_OR_ID):
+        self.submit_feeds((feed,))
+
+    async def run_periodic_task(self):
+        self._stat.print_summary()
+        feed_ids_set = db.effective_utils.EffectiveTasks.get_tasks()
+        if not feed_ids_set:
+            return
+
+        # Assuming the method is called once per minute, let's divide feed_ids into 60 chunks and submit one by one
+        # every second.
+        feed_ids: list[int] = list(feed_ids_set)
+        feed_count = len(feed_ids)
+        chunk_count = 60
+        larger_chunk_count = feed_count % chunk_count
+        smaller_chunk_size = feed_count // chunk_count
+        smaller_chunk_count = chunk_count - larger_chunk_count
+        larger_chunk_size = smaller_chunk_size + 1
+        pos = 0
+        for delay, count in enumerate(chain(
+                repeat(larger_chunk_size, larger_chunk_count),
+                repeat(smaller_chunk_size, smaller_chunk_count)
+        )):
+            if count == 0:
+                break
+            env.loop.call_later(delay, self.submit_feeds, feed_ids[pos:pos + count])
+            pos += count
+        assert pos == feed_count
+
+        logger.debug('Started a periodic monitoring task.')
 
 
 def _defer_next_check_as_per_server_side_cache(wf: web.WebFeed) -> Optional[datetime]:
@@ -197,7 +408,7 @@ def _defer_next_check_as_per_server_side_cache(wf: web.WebFeed) -> Optional[date
     return None
 
 
-async def __monitor(feed: db.Feed, stat: MonitoringStat) -> None:
+async def _do_monitor_a_feed(feed: db.Feed, stat: MonitoringStat):
     """
     Monitor the update of a feed.
 
@@ -206,18 +417,18 @@ async def __monitor(feed: db.Feed, stat: MonitoringStat) -> None:
     """
     now = datetime.now(timezone.utc)
     if feed.next_check_time and now < feed.next_check_time:
-        stat.skipped += 1
+        stat.skipped()
         return  # skip this monitor task
 
     subs = await feed.subs.filter(state=1)
     if not subs:  # nobody has subbed it
         logger.warning(f'Feed {feed.id} ({feed.link}) has no active subscribers.')
         await inner.utils.update_interval(feed)
-        stat.skipped += 1
+        stat.skipped()
         return
 
     if all(locks.user_flood_lock(sub.user_id).locked() for sub in subs):
-        stat.skipped += 1
+        stat.skipped()
         return  # all subscribers are experiencing flood wait, skip this monitor task
 
     headers = {
@@ -235,8 +446,7 @@ async def __monitor(feed: db.Feed, stat: MonitoringStat) -> None:
     try:
         if wf.status == 304:  # cached
             logger.debug(f'Fetched (not updated, cached): {feed.link}')
-            stat.not_updated += 1
-            stat.cached += 1
+            stat.cached()
             return
 
         if rss_d is None:  # error occurred
@@ -249,14 +459,14 @@ async def __monitor(feed: db.Feed, stat: MonitoringStat) -> None:
                 logger.error(f'Deactivated due to too many ({feed.error_count}) errors '
                              f'(current: {wf.error}): {feed.link}')
                 await __deactivate_feed_and_notify_all(feed, subs, reason=wf.error)
-                stat.failed += 1
+                stat.failed()
                 return
             if feed.error_count >= 10:  # too much error, defer next check
                 interval = feed.interval or db.EffectiveOptions.default_interval
                 if (next_check_interval := min(interval, 15) * min(feed.error_count // 10 + 1, 5)) > interval:
                     new_next_check_time = now + timedelta(minutes=next_check_interval)
             logger.debug(f'Fetched (failed, {feed.error_count}th retry, {wf.error}): {feed.link}')
-            stat.failed += 1
+            stat.failed()
             return
 
         wr = wf.web_response
@@ -271,8 +481,7 @@ async def __monitor(feed: db.Feed, stat: MonitoringStat) -> None:
 
         if not rss_d.entries:  # empty
             logger.debug(f'Fetched (not updated, empty): {feed.link}')
-            stat.not_updated += 1
-            stat.empty += 1
+            stat.empty()
             return
 
         title = rss_d.feed.title
@@ -287,7 +496,7 @@ async def __monitor(feed: db.Feed, stat: MonitoringStat) -> None:
 
         if not updated_entries:  # not updated
             logger.debug(f'Fetched (not updated): {feed.link}')
-            stat.not_updated += 1
+            stat.not_updated()
             return
 
         logger.debug(f'Updated: {feed.link}')
@@ -311,7 +520,7 @@ async def __monitor(feed: db.Feed, stat: MonitoringStat) -> None:
             await feed.save(update_fields=feed_updated_fields)
 
     await asyncio.gather(*(__notify_all(feed, subs, entry) for entry in reversed(updated_entries)))
-    stat.updated += 1
+    stat.updated()
     return
 
 
